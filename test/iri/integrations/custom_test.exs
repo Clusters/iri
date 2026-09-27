@@ -33,11 +33,18 @@ defmodule Iri.Integrations.CustomTest do
     assert Repo.get_by!(GameSource, provider: :igdb, external_id: "10").manual_lock
   end
 
-  test "records typed-in hours on a newly added custom game" do
-    scope = viewer_user_fixture() |> Scope.for_user()
+  test "a newly added custom game starts at zero hours and reports the added game" do
+    user = viewer_user_fixture()
+    scope = Scope.for_user(user)
 
-    assert {:ok, %{added: 1}} = Custom.add_id(scope, 10, playtime_minutes: 210)
-    assert Repo.one!(LibraryItem).playtime_minutes == 210
+    assert {:ok, %{added: 1, added_games: [game]}} = Custom.add_id(scope, 10)
+    assert Repo.one!(LibraryItem).playtime_minutes == 0
+
+    # Typed-in hours are the viewer's personal offset, set by the caller.
+    assert {:ok, _state} = Personalization.set_playtime_offset(scope, game.id, 210)
+
+    assert Repo.get_by!(UserGameState, user_id: user.id, game_id: game.id).playtime_offset_minutes ==
+             210
   end
 
   test "a batch add without hours leaves playtime at zero" do
@@ -124,12 +131,12 @@ defmodule Iri.Integrations.CustomTest do
     assert statuses[10] == %{owned: true, custom_owned: false}
   end
 
-  test "replaces one user's custom selection and carries playtime and organization forward" do
+  test "replaces one user's custom selection and carries offset, state, and organization forward" do
     user = viewer_user_fixture()
     scope = Scope.for_user(user)
 
-    assert {:ok, %{added: 1}} = Custom.add_id(scope, 10, playtime_minutes: 210)
-    old_game = Repo.get_by!(Game, igdb_id: 10)
+    assert {:ok, %{added: 1, added_games: [old_game]}} = Custom.add_id(scope, 10)
+    assert {:ok, _state} = Personalization.set_playtime_offset(scope, old_game.id, 210)
     assert {:ok, _state} = Personalization.set_completion_state(scope, old_game.id, "playing")
     assert {:ok, collection} = Collections.create_collection(scope, %{name: "Favorites"})
     assert {:ok, 1} = Collections.add_games(scope, collection.id, [old_game.id])
@@ -142,14 +149,37 @@ defmodule Iri.Integrations.CustomTest do
     assert target_game.igdb_id == 20
     refute Repo.get_by(GameSource, provider: :igdb, external_id: "10")
     assert Repo.get_by!(GameSource, provider: :igdb, external_id: "20").game_id == target_game.id
-    assert Repo.one!(LibraryItem).playtime_minutes == 210
 
-    assert Repo.get_by!(UserGameState, user_id: user.id, game_id: target_game.id).state ==
-             "playing"
+    # Items start and stay at zero; the typed hours ride along as the offset.
+    assert Enum.all?(Repo.all(LibraryItem), &(&1.playtime_minutes == 0))
+
+    target_state = Repo.get_by!(UserGameState, user_id: user.id, game_id: target_game.id)
+    assert target_state.state == "playing"
+    assert target_state.playtime_offset_minutes == 210
 
     refute Repo.get_by(UserGameState, user_id: user.id, game_id: old_game.id)
 
     assert {:ok, _collection, entries} = Collections.list_collection_games(scope, collection.id)
     assert Enum.map(entries, & &1.game_id) == [target_game.id]
+  end
+
+  test "replacing onto an already-owned game merges the offsets instead of losing hours" do
+    user = viewer_user_fixture()
+    scope = Scope.for_user(user)
+
+    assert {:ok, %{added: 1, added_games: [old_game]}} = Custom.add_id(scope, 10)
+    assert {:ok, _} = Personalization.set_playtime_offset(scope, old_game.id, 210)
+
+    assert {:ok, %{added: 1, added_games: [target_game]}} = Custom.add_id(scope, 20)
+    assert {:ok, _} = Personalization.set_playtime_offset(scope, target_game.id, 90)
+
+    assert {:ok, %{game: final_game}} =
+             Custom.replace_game(scope, old_game.id, 20,
+               cache_cover: fn _game_id, _options -> {:ok, :cached} end
+             )
+
+    final_state = Repo.get_by!(UserGameState, user_id: user.id, game_id: final_game.id)
+    assert final_state.playtime_offset_minutes == 300
+    refute Repo.get_by(UserGameState, user_id: user.id, game_id: old_game.id)
   end
 end

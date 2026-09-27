@@ -66,11 +66,6 @@ defmodule Iri.Integrations.Custom do
 
   @doc """
   Fetches selected IGDB records and creates private custom-library ownership.
-
-  `options[:playtime_minutes]` is honored only when adding a single game
-  (`ids` has exactly one entry) - a batch add always starts every game at
-  zero hours, since one typed-in value has no sane meaning spread across
-  unrelated games.
   """
   def add_ids(scope, ids, options \\ [])
 
@@ -78,10 +73,10 @@ defmodule Iri.Integrations.Custom do
     with true <- length(ids) <= @max_batch,
          {:ok, credentials} <- credentials(options),
          {:ok, payloads} <- fetch_games(ids, credentials, options) do
-      playtime_minutes = if match?([_], ids), do: Keyword.get(options, :playtime_minutes)
-      results = Enum.map(payloads, &add_payload(scope, user, &1, playtime_minutes))
+      results = Enum.map(payloads, &add_payload(scope, user, &1))
       added = Enum.count(results, &match?({:ok, _}, &1))
       already_owned = Enum.count(results, &match?({:already_owned, _}, &1))
+      added_games = for {:ok, game} <- results, do: game
       schedule_cover_cache(results, options)
 
       {:ok,
@@ -90,6 +85,7 @@ defmodule Iri.Integrations.Custom do
          found: length(payloads),
          added: added,
          already_owned: already_owned,
+         added_games: added_games,
          failed: length(ids) - added - already_owned
        }}
     else
@@ -241,15 +237,14 @@ defmodule Iri.Integrations.Custom do
     end)
   end
 
-  defp add_payload(scope, user, %{"id" => _id, "name" => _title} = payload, playtime_minutes) do
+  defp add_payload(scope, user, %{"id" => _id, "name" => _title} = payload) do
     with {:ok, game} <- Enricher.ingest_selected_game(payload) do
       if Access.game?(scope, game.id) do
         {:already_owned, game}
       else
         with {:ok, account} <- ensure_account(user) do
           Repo.transact(fn ->
-            with {:ok, _item} <-
-                   upsert_custom_ownership(account, game, payload, playtime_minutes) do
+            with {:ok, _item} <- upsert_custom_ownership(account, game, payload) do
               {:ok, game}
             end
           end)
@@ -263,13 +258,7 @@ defmodule Iri.Integrations.Custom do
       fn ->
         with %LibraryItem{} = old_item <- custom_item(user.id, old_game.id),
              {:ok, _target_item} <-
-               maybe_add_custom_item(
-                 scope,
-                 user,
-                 target_game,
-                 payload,
-                 old_item.playtime_minutes
-               ),
+               maybe_add_custom_item(scope, user, target_game, payload),
              {:ok, _deleted} <- Repo.delete(old_item) do
           old_source_id = old_item.game_source_id
 
@@ -288,12 +277,12 @@ defmodule Iri.Integrations.Custom do
     )
   end
 
-  defp maybe_add_custom_item(scope, user, target_game, payload, playtime_minutes) do
+  defp maybe_add_custom_item(scope, user, target_game, payload) do
     if Access.game?(scope, target_game.id) do
       {:ok, :already_owned}
     else
       with {:ok, account} <- ensure_account(user) do
-        upsert_custom_ownership(account, target_game, payload, playtime_minutes)
+        upsert_custom_ownership(account, target_game, payload)
       end
     end
   end
@@ -301,8 +290,7 @@ defmodule Iri.Integrations.Custom do
   defp upsert_custom_ownership(
          account,
          game,
-         %{"id" => id, "name" => title} = payload,
-         playtime_minutes
+         %{"id" => id, "name" => title} = payload
        ) do
     source =
       Repo.get_by(GameSource, provider: :igdb, external_id: to_string(id)) || %GameSource{}
@@ -333,13 +321,6 @@ defmodule Iri.Integrations.Custom do
         hidden: false,
         removed_at: nil
       }
-
-      # Left uncast when no value was supplied, so repeat and batch paths keep
-      # whatever hours the item already carries.
-      attrs =
-        if is_integer(playtime_minutes),
-          do: Map.put(attrs, :playtime_minutes, playtime_minutes),
-          else: attrs
 
       item
       |> LibraryItem.changeset(attrs)
@@ -381,7 +362,10 @@ defmodule Iri.Integrations.Custom do
         |> UserGameState.changeset(%{
           state: target.state || old.state,
           notes: target.notes || old.notes,
-          rating: target.rating || old.rating
+          rating: target.rating || old.rating,
+          # Offsets are additive personalization: hours typed for the same
+          # real title must not be lost when both rows already exist.
+          playtime_offset_minutes: target.playtime_offset_minutes + old.playtime_offset_minutes
         })
         |> Repo.update!()
 

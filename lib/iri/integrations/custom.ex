@@ -262,9 +262,9 @@ defmodule Iri.Integrations.Custom do
              {:ok, _deleted} <- Repo.delete(old_item) do
           old_source_id = old_item.game_source_id
 
-          unless Access.game?(scope, old_game.id) do
-            migrate_personalization(user.id, old_game.id, target_game.id)
-          end
+          # The viewer's own copy of the old game is gone by now, so this
+          # decides what of their personalization follows the re-point.
+          migrate_personalization(scope, user.id, old_game.id, target_game.id)
 
           cleanup_unused_source(old_source_id)
           {:ok, %{game: target_game}}
@@ -341,12 +341,57 @@ defmodule Iri.Integrations.Custom do
     )
   end
 
-  defp migrate_personalization(user_id, old_game_id, target_game_id) do
-    migrate_user_state(user_id, old_game_id, target_game_id)
+  defp migrate_personalization(scope, user_id, old_game_id, target_game_id) do
+    # The offset is the viewer's typed hours for their own entry, which now
+    # points at the target, so it always follows the fix — even when the old
+    # game stays reachable (e.g. a family member owns the same game), where
+    # skipping it would strand the hours at 0 on the fixed game. Same for
+    # the collection entries, which organize the viewer's own library.
+    migrate_playtime_offset(user_id, old_game_id, target_game_id)
     migrate_collection_entries(user_id, old_game_id, target_game_id)
+
+    # State, notes, and rating annotate the old game itself, which may still
+    # be a legitimate part of the viewer's library, so they follow the fix
+    # only when the old game is no longer reachable at all.
+    unless Access.game?(scope, old_game_id) do
+      migrate_user_state(user_id, old_game_id, target_game_id)
+    end
+  end
+
+  defp migrate_playtime_offset(user_id, old_game_id, target_game_id) do
+    old_state = Repo.get_by(UserGameState, user_id: user_id, game_id: old_game_id)
+    offset = (old_state && old_state.playtime_offset_minutes) || 0
+
+    if offset > 0 do
+      target_state = Repo.get_by(UserGameState, user_id: user_id, game_id: target_game_id)
+
+      # Offsets are additive personalization: hours typed for the same real
+      # title must not be lost when both rows already exist.
+      merged = offset + ((target_state && target_state.playtime_offset_minutes) || 0)
+
+      case target_state do
+        nil ->
+          %UserGameState{user_id: user_id, game_id: target_game_id}
+          |> UserGameState.changeset(%{playtime_offset_minutes: merged})
+          |> Repo.insert!()
+
+        %UserGameState{} = target ->
+          target
+          |> UserGameState.changeset(%{playtime_offset_minutes: merged})
+          |> Repo.update!()
+      end
+
+      # The old row may keep state, notes, or a rating for a game that stays
+      # visible, so only its offset leaves with the fix.
+      old_state |> Ecto.Changeset.change(playtime_offset_minutes: 0) |> Repo.update!()
+    else
+      :ok
+    end
   end
 
   defp migrate_user_state(user_id, old_game_id, target_game_id) do
+    # The offset already moved (and was zeroed on the old row) by
+    # migrate_playtime_offset/3, so only the game-annotating fields merge.
     old_state = Repo.get_by(UserGameState, user_id: user_id, game_id: old_game_id)
     target_state = Repo.get_by(UserGameState, user_id: user_id, game_id: target_game_id)
 
@@ -362,10 +407,7 @@ defmodule Iri.Integrations.Custom do
         |> UserGameState.changeset(%{
           state: target.state || old.state,
           notes: target.notes || old.notes,
-          rating: target.rating || old.rating,
-          # Offsets are additive personalization: hours typed for the same
-          # real title must not be lost when both rows already exist.
-          playtime_offset_minutes: target.playtime_offset_minutes + old.playtime_offset_minutes
+          rating: target.rating || old.rating
         })
         |> Repo.update!()
 

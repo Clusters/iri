@@ -121,6 +121,25 @@ defmodule IriWeb.GameLivePlaytimeTest do
     assert has_element?(view, "#flash-error", "Enter hours between 0 and 100,000.")
   end
 
+  test "a save failure flashes the generic message instead of the parse hint", %{conn: conn} do
+    user = viewer_user_fixture()
+    account = account_fixture(user, :psn, "psn-generic")
+    game = game_fixture(account, 0)
+
+    {:ok, view, _html} = conn |> log_in_user(user) |> live(~p"/games/#{game.slug}")
+
+    # Dropping access after the page loaded makes the save itself fail, not
+    # the parsing of the typed hours.
+    account |> Ecto.Changeset.change(enabled: false) |> Repo.update!()
+
+    view
+    |> form("#personal-playtime", playtime: %{hours: "5"})
+    |> render_submit()
+
+    assert has_element?(view, "#flash-error", "Could not save your playtime.")
+    refute has_element?(view, "#flash-error", "Enter hours between 0 and 100,000.")
+  end
+
   test "a shared custom game gets a personal offset without claiming the game", %{conn: conn} do
     owner = viewer_user_fixture()
     viewer = viewer_user_fixture()

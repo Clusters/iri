@@ -129,6 +129,15 @@ defmodule Iri.Repo.Migrations.AddPlaytimeOffsetToUserGameStatesTest do
              })
   end
 
+  test "down fails loudly, because the migration is irreversible" do
+    # A no-op down would make Ecto mark the rollback as successful while the
+    # column stays in the database; the next forward migration would then fail
+    # on the duplicate column. The rollback must fail loudly instead.
+    assert_raise Ecto.MigrationError, fn ->
+      AddPlaytimeOffsetToUserGameStates.down()
+    end
+  end
+
   defp run_migration_data do
     for sql <- AddPlaytimeOffsetToUserGameStates.data_migrations() do
       Repo.query!(sql)

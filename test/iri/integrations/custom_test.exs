@@ -163,6 +163,67 @@ defmodule Iri.Integrations.CustomTest do
     assert Enum.map(entries, & &1.game_id) == [target_game.id]
   end
 
+  test "fixing the match moves the offset and collection forward while the old game stays accessible" do
+    user = viewer_user_fixture()
+    scope = Scope.for_user(user)
+    stranger = viewer_user_fixture()
+
+    assert {:ok, %{added: 1, added_games: [old_game]}} = Custom.add_id(scope, 10)
+    assert {:ok, _state} = Personalization.set_playtime_offset(scope, old_game.id, 210)
+    assert {:ok, _state} = Personalization.set_rating(scope, old_game.id, 4.5)
+    assert {:ok, collection} = Collections.create_collection(scope, %{name: "Favorites"})
+    assert {:ok, 1} = Collections.add_games(scope, collection.id, [old_game.id])
+
+    # The old game stays visible to the user through a shared library of
+    # someone else (e.g. a family member owns the same game).
+    stranger_account =
+      %ProviderAccount{}
+      |> ProviderAccount.changeset(%{
+        provider: :steam,
+        external_user_id: "76561197999999999",
+        display_name: "Family Steam",
+        sharing_policy: :everyone
+      })
+      |> Ecto.Changeset.put_change(:owner_user_id, stranger.id)
+      |> Repo.insert!()
+
+    stranger_source =
+      %GameSource{}
+      |> GameSource.changeset(%{
+        provider: :steam,
+        external_id: "family-620",
+        source_title: "Canonical Game 10",
+        game_id: old_game.id
+      })
+      |> Repo.insert!()
+
+    %LibraryItem{}
+    |> LibraryItem.changeset(%{
+      provider_account_id: stranger_account.id,
+      game_source_id: stranger_source.id,
+      relationship: :owned
+    })
+    |> Repo.insert!()
+
+    assert {:ok, %{game: target_game}} =
+             Custom.replace_game(scope, old_game.id, 20,
+               cache_cover: fn _game_id, _options -> {:ok, :cached} end
+             )
+
+    # The offset and the organization follow the fixed custom game even
+    # though the old game is still visible ...
+    assert Repo.get_by!(UserGameState, user_id: user.id, game_id: target_game.id).playtime_offset_minutes ==
+             210
+
+    assert {:ok, _collection, entries} = Collections.list_collection_games(scope, collection.id)
+    assert Enum.map(entries, & &1.game_id) == [target_game.id]
+
+    # ... while the old game keeps its own personalization, minus the moved offset.
+    old_state = Repo.get_by!(UserGameState, user_id: user.id, game_id: old_game.id)
+    assert old_state.rating == 4.5
+    assert old_state.playtime_offset_minutes == 0
+  end
+
   test "replacing onto an already-owned game merges the offsets instead of losing hours" do
     user = viewer_user_fixture()
     scope = Scope.for_user(user)
@@ -180,6 +241,29 @@ defmodule Iri.Integrations.CustomTest do
 
     final_state = Repo.get_by!(UserGameState, user_id: user.id, game_id: final_game.id)
     assert final_state.playtime_offset_minutes == 300
+    refute Repo.get_by(UserGameState, user_id: user.id, game_id: old_game.id)
+  end
+
+  test "replacing onto an already-owned game clamps the merged offset at the storage bound" do
+    user = viewer_user_fixture()
+    scope = Scope.for_user(user)
+
+    assert {:ok, %{added: 1, added_games: [old_game]}} = Custom.add_id(scope, 10)
+    assert {:ok, _state} = Personalization.set_playtime_offset(scope, old_game.id, 6_000_000)
+
+    assert {:ok, %{added: 1, added_games: [target_game]}} = Custom.add_id(scope, 20)
+    assert {:ok, _state} = Personalization.set_playtime_offset(scope, target_game.id, 6_000_000)
+
+    assert {:ok, %{game: final_game}} =
+             Custom.replace_game(scope, old_game.id, 20,
+               cache_cover: fn _game_id, _options -> {:ok, :cached} end
+             )
+
+    # 100,000 h + 100,000 h would exceed the signed-wide storage bound; the
+    # merge clamps instead of tripping the check constraint mid-transaction.
+    assert Repo.get_by!(UserGameState, user_id: user.id, game_id: final_game.id).playtime_offset_minutes ==
+             6_000_000
+
     refute Repo.get_by(UserGameState, user_id: user.id, game_id: old_game.id)
   end
 end

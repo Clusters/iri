@@ -64,11 +64,14 @@ defmodule Iri.Repo.Migrations.AddPlaytimeOffsetToUserGameStates do
   The raw data-migration statements, in execution order.
 
   1. Move hours typed onto non-self-reporting items (custom/Epic/PSN) into
-     the owning user's offset. Today the writer stamped the same value onto
-     every editable item of a user's game, so per (account owner, game) the
-     MAX of the item hours is the deduplicated typed value — SUM would
-     triple-count it. The upsert ADDS to a pre-existing offset so
-     already-personalized rows keep their value.
+     the owning user's offset. Only hours the owner can still see count:
+     hidden items, removed items, and items of disabled accounts are
+     skipped, mirroring the visibility rules the rest of the app applies.
+     Today the writer stamped the same value onto every editable item of a
+     user's game, so per (account owner, game) the MAX of the item hours is
+     the deduplicated typed value — SUM would triple-count it. The upsert
+     ADDS to a pre-existing offset so already-personalized rows keep their
+     value.
   2. Zero exactly the items whose hours were moved. The WHERE mirrors the
      upsert source set precisely (including owner_user_id IS NOT NULL), so
      hours sitting on owner-less shared accounts — personal to no one, hence
@@ -89,7 +92,10 @@ defmodule Iri.Repo.Migrations.AddPlaytimeOffsetToUserGameStates do
         JOIN game_sources gs ON gs.id = li.game_source_id
         JOIN provider_accounts pa ON pa.id = li.provider_account_id
         WHERE li.playtime_minutes > 0
+          AND NOT li.hidden
+          AND li.removed_at IS NULL
           AND pa.provider NOT IN ('steam', 'gog', 'xbox')
+          AND pa.enabled
           AND gs.game_id IS NOT NULL
           AND pa.owner_user_id IS NOT NULL
         GROUP BY pa.owner_user_id, gs.game_id
@@ -114,7 +120,10 @@ defmodule Iri.Repo.Migrations.AddPlaytimeOffsetToUserGameStates do
         JOIN game_sources gs ON gs.id = li.game_source_id
         JOIN provider_accounts pa ON pa.id = li.provider_account_id
         WHERE li.playtime_minutes > 0
+          AND NOT li.hidden
+          AND li.removed_at IS NULL
           AND pa.provider NOT IN ('steam', 'gog', 'xbox')
+          AND pa.enabled
           AND gs.game_id IS NOT NULL
           AND pa.owner_user_id IS NOT NULL
       )

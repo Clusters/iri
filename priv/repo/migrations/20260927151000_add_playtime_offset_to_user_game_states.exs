@@ -47,12 +47,17 @@ defmodule Iri.Repo.Migrations.AddPlaytimeOffsetToUserGameStates do
     Enum.each(data_migrations(), &execute/1)
   end
 
-  # Deliberate no-op: the offset column has absorbed the hours of the items
-  # that were zeroed below, so dropping the column would destroy the only
-  # copy of those manual hours. Reverting this migration is a manual data
-  # decision, not an automatic one.
+  # Deliberately irreversible: the offset column has absorbed the hours of
+  # the items zeroed below, so dropping the column would destroy the only
+  # copy of those manual hours. It must raise rather than no-op: a
+  # successful `down` would make Ecto delete the version row while the
+  # column stays in the database, and the next `mix ecto.migrate` would then
+  # fail with `duplicate column name: playtime_offset_minutes`. Reverting is
+  # a manual data decision, not an automatic one.
   def down do
-    :ok
+    raise Ecto.MigrationError,
+      message:
+        "irreversible: manual hours now live only in user_game_states.playtime_offset_minutes; restore from a backup"
   end
 
   @doc """

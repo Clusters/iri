@@ -366,8 +366,11 @@ defmodule Iri.Integrations.Custom do
       target_state = Repo.get_by(UserGameState, user_id: user_id, game_id: target_game_id)
 
       # Offsets are additive personalization: hours typed for the same real
-      # title must not be lost when both rows already exist.
-      merged = offset + ((target_state && target_state.playtime_offset_minutes) || 0)
+      # title must not be lost when both rows already exist. Clamping to the
+      # storage bound keeps a pathological sum from tripping the DB check
+      # constraint and failing the whole replace transaction.
+      merged =
+        min(offset + ((target_state && target_state.playtime_offset_minutes) || 0), 6_000_000)
 
       case target_state do
         nil ->
